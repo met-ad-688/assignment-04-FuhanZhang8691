@@ -1,0 +1,210 @@
+---
+title: Assignment 04
+author:
+  - name: Fuhan Zhang
+    affiliations:
+      - id: U38201998
+        name: Boston University
+        city: Boston
+        state: MA
+number-sections: true
+embed-resources: true
+date: '2025-10-08'
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    fig-format: png
+    code-overflow: wrap
+  docx: default
+  pdf: default
+date-modified: today
+date-format: long
+execute:  
+  echo: true
+  eval: true
+  error: false
+  freeze: auto
+---
+# Setup
+```{python}
+#| echo: false
+#| warning: false
+#| message: false
+import os
+# Force PySpark to use internal Spark and correct Java
+os.environ["JAVA_HOME"] = "/usr/lib/jvm/java-17-openjdk-amd64"
+os.environ["SPARK_HOME"] = os.path.join(os.getcwd(), ".venv/lib/python3.12/site-packages/pyspark")
+os.environ["PYSPARK_PYTHON"] = "python3"
+```
+```{python}
+#| eval: true
+#| echo: false
+#| fig-align: center
+
+from pyspark.sql import SparkSession
+import pandas as pd
+import plotly.express as px
+import plotly.io as pio
+import numpy as np
+
+np.random.seed(42)
+
+pio.renderers.default = "notebook"
+
+# Initialize Spark Session
+spark = SparkSession.builder.appName("LightcastData").getOrCreate()
+
+# Load Data
+df = spark.read.option("header", "true").option("inferSchema", "true") \
+    .option("multiLine", "true").option("escape", "\"") \
+    .csv("./data/lightcast_job_postings.csv")
+
+# Show Schema and Sample Data
+print("---This is Diagnostic check, no need to print it in the final doc---")
+# df.printSchema() # comment this line when rendering the submission
+df.show(5)
+pio.renderers.default = "png"
+```
+
+#  Feature Engineering
+## Select Relevant Columns
+```{python}
+#| eval: true
+#| echo: false
+#| fig-align: center
+
+from pyspark.sql.functions import col, pow
+from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler
+from pyspark.ml import Pipeline
+
+eda_cols = [
+    "SALARY",
+    "MIN_YEARS_EXPERIENCE", "MAX_YEARS_EXPERIENCE", "DURATION",
+    "COMPANY_IS_STAFFING", "IS_INTERNSHIP",
+    "STATE_NAME", "REMOTE_TYPE_NAME", "EMPLOYMENT_TYPE_NAME",
+    "MIN_EDULEVELS_NAME", "MAX_EDULEVELS_NAME"
+]
+
+df_eda = df.select(eda_cols)
+df_eda.show(5, truncate=False)
+```
+
+## Missing Values Check with Bar Plot
+```{python}
+from pyspark.sql.functions import col, sum as spark_sum, when, trim, length
+import hvplot.pandas  # enables hvplot on pandas
+
+missing_df = df_eda.select([
+    spark_sum(
+        when(col(c).isNull() | (length(trim(col(c))) == 0), 1)
+        .otherwise(0)).alias(c)
+    for c in df_eda.columns
+])
+
+missing_pd = missing_df.toPandas().T.reset_index()
+missing_pd.columns = ["column", "missing_count"]
+total_rows = df_eda.count()
+missing_pd["missing_pct"] = 100 * missing_pd["missing_count"] / total_rows
+
+missing_pd.sort_values("missing_pct", ascending=False).hvplot.bar(
+    x="column", y="missing_pct", rot=90,
+    title="Percentage of Missing Values by Column",
+    height=600, width=900,
+    ylabel="Missing Percentage (%)", xlabel="Features"
+).opts(xrotation=45)
+```
+
+## Missing Values Heatmap
+```{python}
+import pandas as pd
+
+df_sample = df_eda.sample(fraction=0.01, seed=42).toPandas()
+missing_mask = df_sample.isnull()
+missing_long = (
+    missing_mask.reset_index()
+    .melt(id_vars="index", var_name="column", value_name="is_missing")
+)
+missing_long["is_missing"] = missing_long["is_missing"].astype(int)
+missing_long.hvplot.heatmap(
+    x="column", y="index", C="is_missing",
+    cmap="Reds", colorbar=False,
+    width=900, height=500,
+    title="Heatmap of Missing Values (Sample)"
+).opts(xrotation=45)
+```
+
+## Clean Categorical Column: EMPLOYMENT_TYPE_NAME
+```{python}
+df_eda = df_eda.withColumn(
+    "EMPLOYMENT_TYPE_NAME",
+    when(col("EMPLOYMENT_TYPE_NAME") == "Part-time / full-time", "Flexible")
+    .when(col("EMPLOYMENT_TYPE_NAME") == "Part-time (≤ 32 hours)", "Parttime")
+    .when(col("EMPLOYMENT_TYPE_NAME") == "Full-time (> 32 hours)", "Fulltime")
+    .when(col("EMPLOYMENT_TYPE_NAME").isNull(), "Fulltime")
+    .otherwise(col("EMPLOYMENT_TYPE_NAME"))
+)
+
+categorical_cols = [
+    "EMPLOYMENT_TYPE_NAME"
+]
+
+for colname in categorical_cols:
+    print(f"\n---- {colname} ----")
+    df_eda.select(colname).distinct().show(10, truncate=False)
+```
+
+## Clean Categorical Column: REMOTE_TYPE_NAME
+```{python}
+# For REMOTE_TYPE_NAME replace Remote with Remote,
+# [None] with Undefined, Not Remote with On Premise,
+# Hybrid Remote with Hybrid, and Null with On Premise
+
+df_eda = df_eda.withColumn(
+    "REMOTE_TYPE_NAME",
+    when(col("REMOTE_TYPE_NAME") == "Remote", "Remote")
+    .when(col("REMOTE_TYPE_NAME") == "[None]", "Undefined")
+    .when(col("REMOTE_TYPE_NAME") == "Not Remote", "On Premise")
+    .when(col("REMOTE_TYPE_NAME") == "Hybrid Remote", "Hybrid")
+    .when(col("REMOTE_TYPE_NAME").isNull(), "On Premise")
+    .otherwise(col("REMOTE_TYPE_NAME"))
+)
+
+categorical_cols = [
+    "REMOTE_TYPE_NAME"
+]
+
+for colname in categorical_cols:
+    print(f"\n---- {colname} ----")
+    df_eda.select(colname).distinct().show(50, truncate=False)
+```
+
+## Frequency Visualization
+```{python}
+import hvplot.pandas
+
+df_pd = df_eda.sample(fraction=0.05, seed=42).toPandas()
+
+df_pd["EMPLOYMENT_TYPE_NAME"].value_counts().hvplot.bar(
+    title="Employment Type Frequency",
+    ylabel="Count", xlabel="Employment Type"
+)
+```
+
+## Group Counts
+```{python}
+for colname in categorical_cols:
+    print(f"\n---- {colname} counts ----")
+    df_eda.groupBy(colname).count().orderBy("count", ascending=False).show(20, truncate=False)
+```
+
+## Distinct Counts of All Columns
+```{python}
+from pyspark.sql.functions import countDistinct
+
+df_eda.select([
+    countDistinct(c).alias(c + "_nunique")
+    for c in df_eda.columns
+]).show(truncate=False)
+```
+
