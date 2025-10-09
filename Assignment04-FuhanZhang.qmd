@@ -10,38 +10,27 @@ author:
 number-sections: true
 embed-resources: true
 date: '2025-10-08'
-format:
-  html:
-    toc: true
-    toc-depth: 2
-    fig-format: png
-    code-overflow: wrap
-  docx: default
-  pdf: default
-date-modified: today
-date-format: long
-execute:  
+execute:
   echo: true
   eval: true
+  output: true
+  warning: false
   error: false
-  freeze: auto
+  freeze: false
+  cache: false
+  daemon: false
+  timeout: 600
+format:
+  docx:
+    toc: true
+    toc-depth: 2
 ---
+```{markdown}
+GitHub Link: https://github.com/met-ad-688/assignment-04-FuhanZhang8691.git
+```
+
 # Setup
 ```{python}
-#| echo: false
-#| warning: false
-#| message: false
-import os
-# Force PySpark to use internal Spark and correct Java
-os.environ["JAVA_HOME"] = "/usr/lib/jvm/java-17-openjdk-amd64"
-os.environ["SPARK_HOME"] = os.path.join(os.getcwd(), ".venv/lib/python3.12/site-packages/pyspark")
-os.environ["PYSPARK_PYTHON"] = "python3"
-```
-```{python}
-#| eval: true
-#| echo: false
-#| fig-align: center
-
 from pyspark.sql import SparkSession
 import pandas as pd
 import plotly.express as px
@@ -50,161 +39,416 @@ import numpy as np
 
 np.random.seed(42)
 
-pio.renderers.default = "notebook"
+pio.renderers.default = "notebook+notebook_connected+vscode"
 
 # Initialize Spark Session
-spark = SparkSession.builder.appName("LightcastData").getOrCreate()
+spark = (
+    SparkSession.builder
+    .appName("LightcastData")
+    .config("spark.driver.memory", "4g")   
+    .config("spark.executor.memory", "4g")
+    .config("spark.sql.execution.arrow.pyspark.enabled", "false")
+    .config("spark.ui.showConsoleProgress", "false")
+    .getOrCreate()
+)
 
 # Load Data
 df = spark.read.option("header", "true").option("inferSchema", "true") \
     .option("multiLine", "true").option("escape", "\"") \
     .csv("./data/lightcast_job_postings.csv")
-
-# Show Schema and Sample Data
-print("---This is Diagnostic check, no need to print it in the final doc---")
-# df.printSchema() # comment this line when rendering the submission
-df.show(5)
-pio.renderers.default = "png"
+#df.show(5)
 ```
+During my setup stage, several configuration adjustments were made to prevent the Quarto kernel from dying during execution. Compared with the original instruction on Blackboard, the Spark session specifies higher memory limits "spark.driver.memory and spark.executor.memory" and disables Arrow optimization "spark.sql.execution.arrow.pyspark.enabled=false" to avoid crashes when converting large PySpark DataFrames to pandas. Console progress and excessive Plotly rendering settings were also turned off to ensure smoother and cleaner rendering in VS Code and Word output. 
 
-#  Feature Engineering
-## Select Relevant Columns
+# Missing Values Analysis
 ```{python}
-#| eval: true
-#| echo: false
-#| fig-align: center
+from pyspark.sql.functions import col, when, isnan, count
+from pyspark.sql import Window
+from pyspark.sql.functions import col, when, isnan, count, expr, median
+from pyspark.sql import functions as F
 
+# Calculate Medians by categories
+overall_median_salary = df.approxQuantile("SALARY", [0.5], 0.01)[0]
+median_by_employment_type = df.groupBy("EMPLOYMENT_TYPE").agg(
+    expr("percentile_approx(SALARY, 0.5)").alias("median_salary_emp_type")
+)
+median_by_employment_type_name = df.groupBy("EMPLOYMENT_TYPE_NAME").agg(
+    expr("percentile_approx(SALARY, 0.5)").alias("median_salary_emp_type_name")
+)
+
+# Join median values back to the original dataframe
+df_salary_imputed = df.join(median_by_employment_type, on="EMPLOYMENT_TYPE", how="left") \
+    .join(median_by_employment_type_name, on="EMPLOYMENT_TYPE_NAME", how="left")
+
+# Replace missing SALARY values
+df_salary_imputed = df_salary_imputed.withColumn(
+    "SALARY",
+    when(col("SALARY").isNull() & col("median_salary_emp_type").isNotNull(), col("median_salary_emp_type"))
+    .when(col("SALARY").isNull() & col("median_salary_emp_type_name").isNotNull(), col("median_salary_emp_type_name"))
+    .when(col("SALARY").isNull(), F.lit(overall_median_salary))
+    .otherwise(col("SALARY"))
+)
+```
+In this step, missing salary values were imputed using the median salary within each employment type and its corresponding name. When both type-based medians were unavailable, the overall salary median was applied, maintaining consistency and preventing bias. 
+
+# Feature Engineering 
+```{python}
 from pyspark.sql.functions import col, pow
 from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler
 from pyspark.ml import Pipeline
+from pyspark.sql.types import BooleanType, StringType, IntegerType
+from pyspark.sql.types import IntegerType, DoubleType, DecimalType
+from pyspark.sql.functions import regexp_replace, trim
 
-eda_cols = [
-    "SALARY",
-    "MIN_YEARS_EXPERIENCE", "MAX_YEARS_EXPERIENCE", "DURATION",
-    "COMPANY_IS_STAFFING", "IS_INTERNSHIP",
-    "STATE_NAME", "REMOTE_TYPE_NAME", "EMPLOYMENT_TYPE_NAME",
-    "MIN_EDULEVELS_NAME", "MAX_EDULEVELS_NAME"
+# Drop rows with NAs
+regression_df = df_salary_imputed.dropna(subset=[
+    "SALARY", "MIN_YEARS_EXPERIENCE", "MAX_YEARS_EXPERIENCE",
+    "EDUCATION_LEVELS_NAME", "EMPLOYMENT_TYPE_NAME", "REMOTE_TYPE_NAME",
+    "DURATION", "IS_INTERNSHIP", "COMPANY_IS_STAFFING"
+]).select(
+    "SALARY", "MIN_YEARS_EXPERIENCE", "MAX_YEARS_EXPERIENCE",
+    "EDUCATION_LEVELS_NAME", "EMPLOYMENT_TYPE_NAME", "REMOTE_TYPE_NAME",
+    "DURATION", "IS_INTERNSHIP", "COMPANY_IS_STAFFING",
+    "median_salary_emp_type", "median_salary_emp_type_name"
+)
+
+# Categorical columns
+categorical_cols = [
+    "EDUCATION_LEVELS_NAME", "EMPLOYMENT_TYPE_NAME", "REMOTE_TYPE_NAME",
+    "IS_INTERNSHIP", "COMPANY_IS_STAFFING"
 ]
 
-df_eda = df.select(eda_cols)
-df_eda.show(5, truncate=False)
-```
+regression_df = regression_df.withColumn("IS_INTERNSHIP", col("IS_INTERNSHIP").cast(IntegerType()))
+regression_df = regression_df.withColumn("COMPANY_IS_STAFFING", col("COMPANY_IS_STAFFING").cast(IntegerType()))
 
-## Missing Values Check with Bar Plot
+# Convert Duration numerically
+regression_df = regression_df.withColumn("DURATION", col("DURATION").cast(IntegerType()))
+for c in ["EDUCATION_LEVELS_NAME", "EMPLOYMENT_TYPE_NAME", "REMOTE_TYPE_NAME"]:
+    regression_df = regression_df.withColumn(
+        c, trim(regexp_replace(col(c), r'[\[\]\n\"]', ""))
+    )
+
+regression_df.show(5, truncate=False)
+```
+In this stage, the dataset was refined by dropping rows with missing values in critical predictors such as experience range, duration, and categorical employment attributes to ensure a clean input for modeling. The cleaned data reveals a structured pattern, for instance, most postings indicate full-time roles with consistent median salaries around 116,500, suggesting limited salary variation within the filtered sample.Key categorical variables, including Education Level, Employment Type, Remote Type, Internship Status, and Staffing Company Indicator, were encoded numerically. Additionally, the education field, initially embedded in array was cleaned to retain meaningful text. Plus, Duration and binary fields, such as “IS_INTERNSHIP, COMPANY_IS_STAFFING” were cast to integers.
+
+# Linear Regression Model(OLS)
 ```{python}
-from pyspark.sql.functions import col, sum as spark_sum, when, trim, length
-import hvplot.pandas  # enables hvplot on pandas
+# Clean Education Levels by cleaning \n and array brackets
+from pyspark.sql.functions import regexp_replace, trim
+regression_df = regression_df.withColumn(
+    "EDUCATION_LEVELS_NAME",
+    trim(regexp_replace(col("EDUCATION_LEVELS_NAME"), r"[\[\]\n]", ""))
+)
 
-missing_df = df_eda.select([
-    spark_sum(
-        when(col(c).isNull() | (length(trim(col(c))) == 0), 1)
-        .otherwise(0)).alias(c)
-    for c in df_eda.columns
-])
+# Index
+indexers = [StringIndexer(inputCol=col, outputCol=f"{col}_idx", handleInvalid='skip') for col in categorical_cols]
+encoders = [OneHotEncoder(inputCol=f"{col}_idx", outputCol=f"{col}_vec") for col in categorical_cols]
 
-missing_pd = missing_df.toPandas().T.reset_index()
-missing_pd.columns = ["column", "missing_count"]
-total_rows = df_eda.count()
-missing_pd["missing_pct"] = 100 * missing_pd["missing_count"] / total_rows
+# Assemble
+assembler = VectorAssembler(
+    inputCols=[
+        "MIN_YEARS_EXPERIENCE", "MAX_YEARS_EXPERIENCE", "DURATION"
+    ] + [f"{col}_vec" for col in categorical_cols],
+    outputCol="features"
+)
 
-missing_pd.sort_values("missing_pct", ascending=False).hvplot.bar(
-    x="column", y="missing_pct", rot=90,
-    title="Percentage of Missing Values by Column",
-    height=600, width=900,
-    ylabel="Missing Percentage (%)", xlabel="Features"
-).opts(xrotation=45)
+pipeline = Pipeline(stages=indexers + encoders + [assembler])
+regression_data = pipeline.fit(regression_df).transform(regression_df)
+regression_data.select("SALARY", "features").show(5, truncate=False)
+```
+In this step, categorical predictors such as Education Level, Employment Type, and Remote Type were indexed and one-hot encoded, expanding the feature space to 28 variables that capture diverse job characteristics. From the transformed data, we can observe that most postings share consistent feature patterns with modest variation in experience. For example, MIN/MAX years are between 1 and 7, respectively, and durations range roughly from 6 to 32 weeks, corresponding to stable salaries around $116,500–$131,100. This consistency suggests a relatively narrow job-market segment dominated by full-time professional roles, providing a suitable baseline for assessing how categorical differences may influence compensation.
+
+# Train/Test Split
+```{python}
+regression_train, regression_test = regression_data.randomSplit([0.8, 0.2], seed=42)
+
+print((regression_data.count(), len(regression_data.columns)))
+print((regression_train.count(), len(regression_train.columns)))
+print((regression_test.count(), len(regression_test.columns)))
+```
+The full dataset of 5,039 observations was randomly divided into 4,070 training samples (≈80%) and 969 testing samples (≈20%), using a fixed seed value of 42 to ensure reproducibility. 
+
+# Linear Regression (Get this model from Lab 5.2)
+```{python}
+from pyspark.ml.regression import GeneralizedLinearRegression
+
+feature_names = assembler.getInputCols()
+
+glr = GeneralizedLinearRegression(
+    featuresCol="features",
+    labelCol="SALARY",
+    family="gaussian",  
+    link="identity",   
+    maxIter=10,    
+    regParam=0.3   
+)
+
+glr_model = glr.fit(regression_train)
+summary = glr_model.summary
+```
+In this section, the key parameters include maxIter=10, setting the maximum number of iterations for least-squares optimization, and regParam=0.3, applying L2 regularization to penalize large coefficients and prevent overfitting. By defining featuresCol="features" and labelCol="SALARY", the model uses the assembled feature vector as input and the salary field as the dependent variable.
+
+```{python}
+# Coefficients and Intercept
+print("Intercept: {:.4f}".format(glr_model.intercept))
+print("Coefficients:")
+for i, coef in enumerate(glr_model.coefficients):
+    print(f" Feature {i + 1}: {coef:.4f}")
+```
+The estimated intercept is $86,495.38, representing the baseline salary for a job posting with reference-level categories and zero values for continuous predictors. Several coefficients are positive, such as those related to education level and remote type, suggesting modest upward adjustments in predicted salary. However, many coefficients are relatively small compared to the intercept, reflecting that base salary level dominates variation across the dataset.
+
+```{python}
+# Summary stats
+print("\n--- Regression Summary ---")
+print("Coefficient Standard Errors:", [f"{val:.4f}" for val in summary.coefficientStandardErrors])
+print("T Values:", [f"{val:.4f}" for val in summary.tValues])
+print("P Values:", [f"{val:.4f}" for val in summary.pValues])
+```
+The summary statistics reveal large standard errors (≈ 20,000–25,000) and high p-values (> 0.1) for most education-related dummy variables.Plus, there are a few predictors that show statistical significance, such as "Ph.D. or professional degree" which p = 0.0318, "Remote type = [None]" which p = 0.0215, and "Company is staffing = 0", which p < 0.001.These results suggest that advanced education, job format, and company type meaningfully influence compensation.
+
+```{python}
+# print(f"\nDispersion: {summary.dispersion:.4f}")
+print(f"Null Deviance: {summary.nullDeviance:.4f}")
+print(f"Residual DF Null: {summary.residualDegreeOfFreedomNull}")
+print(f"Deviance: {summary.deviance:.4f}")
+print(f"Residual DF: {summary.residualDegreeOfFreedom}")
+```
+Model diagnostics show a Null Deviance of 2.32 × 10¹² and a Residual Deviance of 1.81 × 10¹², indicating that the fitted model reduces unexplained variation by roughly 22 % compared with a null (intercept-only) model.
+
+```{python}
+# Retrieve feature names
+feature_names = summary._call_java("featureNames")
+
+# Create full coefficient table
+features = ["Intercept"] + feature_names
+coefs = [glr_model.intercept] + list(glr_model.coefficients)
+se = list(summary.coefficientStandardErrors)
+tvals = list(summary.tValues)
+pvals = list(summary.pValues)
 ```
 
-## Missing Values Heatmap
+
 ```{python}
 import pandas as pd
+from tabulate import tabulate
+from IPython.display import HTML
 
-df_sample = df_eda.sample(fraction=0.01, seed=42).toPandas()
-missing_mask = df_sample.isnull()
-missing_long = (
-    missing_mask.reset_index()
-    .melt(id_vars="index", var_name="column", value_name="is_missing")
-)
-missing_long["is_missing"] = missing_long["is_missing"].astype(int)
-missing_long.hvplot.heatmap(
-    x="column", y="index", C="is_missing",
-    cmap="Reds", colorbar=False,
-    width=900, height=500,
-    title="Heatmap of Missing Values (Sample)"
-).opts(xrotation=45)
+coef_table = pd.DataFrame({
+    "Feature": features,
+    "Estimate": [f"{v:.4f}" if v is not None else None for v in coefs],
+    "Std Error": [f"{v:.4f}" if v is not None else None for v in se],
+    "t-stat": [f"{v:.4f}" if v is not None else None for v in tvals],
+    "p-value": [f"{v:.4f}" if v is not None else None for v in pvals]
+})
+coef_table.to_csv("output/glr_summary.csv", index=False)
 ```
 
-## Clean Categorical Column: EMPLOYMENT_TYPE_NAME
+
+# Polynomial Regression
 ```{python}
-df_eda = df_eda.withColumn(
-    "EMPLOYMENT_TYPE_NAME",
-    when(col("EMPLOYMENT_TYPE_NAME") == "Part-time / full-time", "Flexible")
-    .when(col("EMPLOYMENT_TYPE_NAME") == "Part-time (≤ 32 hours)", "Parttime")
-    .when(col("EMPLOYMENT_TYPE_NAME") == "Full-time (> 32 hours)", "Fulltime")
-    .when(col("EMPLOYMENT_TYPE_NAME").isNull(), "Fulltime")
-    .otherwise(col("EMPLOYMENT_TYPE_NAME"))
-)
+# Polynomial Regression
+from pyspark.ml.feature import PolynomialExpansion, VectorAssembler
+from pyspark.ml.regression import GeneralizedLinearRegression
+from pyspark.ml import Pipeline
+from pyspark.ml.evaluation import RegressionEvaluator
+import pandas as pd
 
-categorical_cols = [
-    "EMPLOYMENT_TYPE_NAME"
-]
+# Create polynomial feature
+poly_assembler = VectorAssembler(inputCols=["MIN_YEARS_EXPERIENCE"], outputCol="min_years_vec")
+poly_expansion = PolynomialExpansion(degree=2, inputCol="min_years_vec", outputCol="poly_features")
 
-for colname in categorical_cols:
-    print(f"\n---- {colname} ----")
-    df_eda.select(colname).distinct().show(10, truncate=False)
-```
-
-## Clean Categorical Column: REMOTE_TYPE_NAME
-```{python}
-# For REMOTE_TYPE_NAME replace Remote with Remote,
-# [None] with Undefined, Not Remote with On Premise,
-# Hybrid Remote with Hybrid, and Null with On Premise
-
-df_eda = df_eda.withColumn(
-    "REMOTE_TYPE_NAME",
-    when(col("REMOTE_TYPE_NAME") == "Remote", "Remote")
-    .when(col("REMOTE_TYPE_NAME") == "[None]", "Undefined")
-    .when(col("REMOTE_TYPE_NAME") == "Not Remote", "On Premise")
-    .when(col("REMOTE_TYPE_NAME") == "Hybrid Remote", "Hybrid")
-    .when(col("REMOTE_TYPE_NAME").isNull(), "On Premise")
-    .otherwise(col("REMOTE_TYPE_NAME"))
+# Combine polynomial feature
+poly_features_assembler = VectorAssembler(
+    inputCols=["poly_features", "MAX_YEARS_EXPERIENCE", "DURATION"] + [f"{c}_vec" for c in categorical_cols],
+    outputCol="features_poly"
 )
 
-categorical_cols = [
-    "REMOTE_TYPE_NAME"
-]
+# Build pipeline
+poly_pipeline = Pipeline(stages=indexers + encoders + [poly_assembler, poly_expansion, poly_features_assembler])
 
-for colname in categorical_cols:
-    print(f"\n---- {colname} ----")
-    df_eda.select(colname).distinct().show(50, truncate=False)
-```
+# Transformation
+poly_data = poly_pipeline.fit(regression_df).transform(regression_df)
 
-## Frequency Visualization
-```{python}
-import hvplot.pandas
+# Train/Test split
+poly_train, poly_test = poly_data.randomSplit([0.8, 0.2], seed=42)
 
-df_pd = df_eda.sample(fraction=0.05, seed=42).toPandas()
-
-df_pd["EMPLOYMENT_TYPE_NAME"].value_counts().hvplot.bar(
-    title="Employment Type Frequency",
-    ylabel="Count", xlabel="Employment Type"
+# Train GLR model on polynomial features
+poly_glr = GeneralizedLinearRegression(
+    featuresCol="features_poly",
+    labelCol="SALARY",
+    family="gaussian",
+    link="identity"
 )
-```
+poly_model = poly_glr.fit(poly_train)
+poly_summary = poly_model.summary
 
-## Group Counts
+# Evaluate predictions manually (R², RMSE, MAE)
+poly_predictions = poly_model.transform(poly_test)
+evaluator = RegressionEvaluator(labelCol="SALARY", predictionCol="prediction")
+
+r2_poly = evaluator.evaluate(poly_predictions, {evaluator.metricName: "r2"})
+rmse_poly = evaluator.evaluate(poly_predictions, {evaluator.metricName: "rmse"})
+mae_poly = evaluator.evaluate(poly_predictions, {evaluator.metricName: "mae"})
+
+# Results
+print(f"R²: {r2_poly:.4f}")
+print(f"RMSE: {rmse_poly:.4f}")
+print(f"MAE: {mae_poly:.4f}")
+print(f"Deviance: {poly_summary.deviance:.4f}")
+print(f"Null Deviance: {poly_summary.nullDeviance:.4f}")
+print(f"Dispersion: {poly_summary.dispersion:.4f}")
+print(f"AIC: {poly_summary.aic:.4f}")
+print(f"Residual DF: {poly_summary.residualDegreeOfFreedom}")
+print(f"Null DF: {poly_summary.residualDegreeOfFreedomNull}")
+
+print(f"\nIntercept: {poly_model.intercept:.4f}")
+print("Coefficients:")
+for i, coef in enumerate(poly_model.coefficients):
+    print(f"  β{i+1}: {coef:.4f}")
+```
+The polynomial regression model extends the baseline GLR by adding a squared term for MIN_YEARS_EXPERIENCE to capture potential nonlinear effects of experience on salary. The model achieves an R² of 0.2004, indicating that roughly 20% of salary variation is explained by the predictors. The RMSE (≈ 21,937) and MAE (≈ 15,387) reflect moderate prediction accuracy, with smaller average errors compared to the simple GLR model. The Deviance (1.78×10¹²) is lower than the Null Deviance (2.32×10¹²), confirming that the model provides a meaningful improvement over the intercept-only baseline. The AIC (92,598.80) also shows a slight enhancement in overall fit, though the improvement is limited. In terms of coefficients, the linear term for experience (β₁ = 3054.70) is positive while the squared term (β₂ = −285.58) is negative, suggesting diminishing marginal returns—salary increases with experience, but the growth rate slows as experience accumulates. The intercept (≈ 89,708) represents the expected base salary for an entry-level job with reference-category attributes.
+
+# Random Forest Regressor
 ```{python}
-for colname in categorical_cols:
-    print(f"\n---- {colname} counts ----")
-    df_eda.groupBy(colname).count().orderBy("count", ascending=False).show(20, truncate=False)
-```
+from pyspark.ml.regression import RandomForestRegressor
+from pyspark.ml.evaluation import RegressionEvaluator
+import seaborn as sns
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
 
-## Distinct Counts of All Columns
+# Train Random Forest Regressor
+rf = RandomForestRegressor(
+    featuresCol="features",
+    labelCol="SALARY",
+    numTrees=200,
+    maxDepth=6,
+    seed=42
+)
+
+rf_model = rf.fit(regression_train)
+rf_predictions = rf_model.transform(regression_test)
+
+# Feature Importances 
+importances = rf_model.featureImportances.toArray()
+num_features = len(importances)
+
+# Retrieve feature names if the number doesn't match the coefficients
+try:
+    feature_names = assembler.getInputCols()
+    if len(feature_names) != num_features:
+        feature_names = [f"Feature_{i+1}" for i in range(num_features)]
+except Exception:
+    feature_names = [f"Feature_{i+1}" for i in range(num_features)]
+
+rf_importance = pd.DataFrame({
+    "Feature": feature_names,
+    "Importance": importances
+}).sort_values(by="Importance", ascending=False).head(10)
+
+# Visualization
+plt.figure(figsize=(8,5))
+sns.barplot(x="Importance", y="Feature", data=rf_importance, color="lightpink")
+plt.title("Top 10 Important Features – Random Forest")
+plt.tight_layout()
+plt.savefig("output/rf_feature_importance.png", dpi=300)
+plt.show()
+```
+The Random Forest Regressor, trained with 200 trees and a maximum depth of 6, was used to evaluate the non-linear relationships between the engineered features and salary. The feature-importance plot shows that “Feature 1” and “Feature 2” dominate the model, together contributing more than half of the total explanatory power. These variables most likely correspond to core experience measures such as “MIN_YEARS_EXPERIENCE” and “MAX_YEARS_EXPERIENCE”, indicating that professional experience remains the strongest determinant of predicted salary levels. Moderate contributions from “Feature 3”, “Feature 7”, and “Feature 6” suggest that employment type or remote status still provide additional predictive value. The remaining variables have relatively minor importance, implying diminishing returns from higher-order or less directly related predictors.
+
+# Compare 3 Models – GLR, Polynomial, RF
 ```{python}
-from pyspark.sql.functions import countDistinct
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+import os
 
-df_eda.select([
-    countDistinct(c).alias(c + "_nunique")
-    for c in df_eda.columns
-]).show(truncate=False)
+# Convert predictions to pandas
+glr_pd = glr_model.transform(regression_test).select("SALARY", "prediction") \
+    .withColumnRenamed("prediction", "PRED_GLR").toPandas()
+
+poly_pd = poly_model.transform(poly_test).select("SALARY", "prediction") \
+    .withColumnRenamed("prediction", "PRED_POLY").toPandas()
+
+rf_pd = rf_model.transform(regression_test).select("SALARY", "prediction") \
+    .withColumnRenamed("prediction", "PRED_RF").toPandas()
+
+# Align length & combine
+min_len = min(len(glr_pd), len(poly_pd), len(rf_pd))
+pred_df = pd.DataFrame({
+    "SALARY": glr_pd["SALARY"].head(min_len),
+    "PRED_GLR": glr_pd["PRED_GLR"].head(min_len),
+    "PRED_POLY": poly_pd["PRED_POLY"].head(min_len),
+    "PRED_RF": rf_pd["PRED_RF"].head(min_len)
+})
+
+# Visualization
+os.makedirs("output", exist_ok=True)
+fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+
+sns.scatterplot(x="SALARY", y="PRED_GLR", data=pred_df, ax=axes[0,0], s=12, color="#fa5c91ff")
+axes[0,0].set_title("GLR: Actual vs Predicted")
+
+sns.scatterplot(x="SALARY", y="PRED_POLY", data=pred_df, ax=axes[0,1], s=12, color="#e71663ff")
+axes[0,1].set_title("Polynomial: Actual vs Predicted")
+
+sns.scatterplot(x="SALARY", y="PRED_RF", data=pred_df, ax=axes[1,0], s=12, color="#f583c4ff")
+axes[1,0].set_title("Random Forest: Actual vs Predicted")
+
+for ax in axes.flat:
+    y_min, y_max = pred_df["SALARY"].min(), pred_df["SALARY"].max()
+    ax.plot([y_min, y_max], [y_min, y_max], color="red", linestyle="--", linewidth=1)
+fig.delaxes(axes[1,1])
+
+plt.tight_layout()
+plt.savefig("output/model_comparison.png", dpi=300)
+plt.show()
 ```
+The figure compares predicted versus actual salary values across three models: Generalized Linear Regression, Polynomial Regression, and Random Forest. All three models show a generally positive correlation between predicted and actual salaries, indicating that they capture the main salary trends in the dataset. The red dashed 45° line represents perfect prediction; points clustering near this line suggest accurate estimation. Among the models, the Random Forest produces predictions that are more tightly aligned with the diagonal, implying lower variance and better generalization on test data. The Polynomial Regression slightly improves over the base GLR, but it still underestimates higher salaries. Overall, Random Forest achieves the most balanced performance in terms of prediction stability and accuracy.
 
+# Calculation
+```{python}
+from pyspark.ml.evaluation import RegressionEvaluator
+import math
+
+# Evaluate RMSE for all models
+evaluator = RegressionEvaluator(labelCol="SALARY", predictionCol="prediction", metricName="rmse")
+rmse_glr = evaluator.evaluate(glr_model.transform(regression_test))
+rmse_poly = evaluator.evaluate(poly_model.transform(poly_test))
+rmse_rf = evaluator.evaluate(rf_model.transform(regression_test))
+
+# Retrieve AIC from summaries
+aic_glr = summary.aic
+aic_poly = poly_summary.aic
+
+# Basic parameters
+n = regression_test.count()
+k_glr = len(assembler.getInputCols())
+k_poly = len(poly_features_assembler.getInputCols())
+k_rf = len(assembler.getInputCols())
+
+# Calculate Log-Likelihood
+loglik_glr = -0.5 * (
+    n * math.log(2 * math.pi)
+    + n * math.log(summary.dispersion)
+    + summary.deviance / summary.dispersion
+)
+loglik_poly = -0.5 * (
+    n * math.log(2 * math.pi)
+    + n * math.log(poly_summary.dispersion)
+    + poly_summary.deviance / poly_summary.dispersion
+)
+
+# Calculate BIC
+bic_glr = k_glr * math.log(n) - 2 * loglik_glr
+bic_poly = k_poly * math.log(n) - 2 * loglik_poly
+bic_rf = k_rf * math.log(n) 
+
+# Results
+print("\n=== Model Comparison Summary ===")
+print(f"GLR:        RMSE={rmse_glr:.2f},  AIC={aic_glr:.2f},  BIC={bic_glr:.2f}")
+print(f"Polynomial: RMSE={rmse_poly:.2f},  AIC={aic_poly:.2f},  BIC={bic_poly:.2f}")
+print(f"RandomForest: RMSE={rmse_rf:.2f},  AIC=N/A,  BIC≈{bic_rf:.2f}")
+```
+From the results, the Random Forest model achieved the lowest RMSE (≈21,264), indicating the highest predictive accuracy among the three. However, since AIC is not defined for tree-based models, its comparison is based solely on error metrics. Between the two regression-based models, the Polynomial Regression slightly outperformed the standard GLR, showing a marginally lower RMSE (21,938 vs. 22,097), and lower AIC and BIC scores (92,598 vs. 92,647 for AIC; 25,165 vs. 25,177 for BIC). These results imply that introducing a second-degree polynomial term for “Minimum Years of Experience” improved model fit without substantially increasing complexity.
