@@ -193,3 +193,4 @@ cython_debug/
 .cursorignore
 .cursorindexingignoredata/lightcast_job_postings.csv
 data/lightcast_job_postings.csv
+spark-3.4.0-bin-hadoop3.tgz
